@@ -137,11 +137,11 @@ function DepartureBoard() {
     : null
 
   return (
-    <div className="w-full max-w-2xl mx-auto py-8">
+    <div className="w-full max-w-2xl mx-auto py-8 px-2 sm:px-4">
       <div className="flex items-center justify-between mb-4">
         <h1 className="text-2xl font-bold">Wanstead & Snaresbrook Departure Board</h1>
       </div>
-      <div className="mb-4 p-4 rounded bg-green-100 text-green-900 font-medium flex flex-col items-start gap-2">
+      <div className="mb-4 p-4 rounded bg-green-100 text-green-900 font-medium flex flex-col items-start gap-2 w-full">
         <div className="text-lg font-semibold">Suggestion</div>
         {soonestGettable ? (
           <>
