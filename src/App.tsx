@@ -9,11 +9,15 @@ const SNARESBROOK_ID = "940GZZLUSNB"
 const MIN_GETTABLE = 5 * 60
 const MAX_GETTABLE = 8 * 60
 const LIVE_REFRESH_MS = 30000
+const STATUS_REFRESH_MS = 2 * 60 * 1000
+const RATE_LIMIT_BACKOFF_MS = 90 * 1000
 const SCHEDULE_LOOKAHEAD_MINUTES = 90
 const LIVE_EXPECTED_WINDOW_SECONDS = 20 * 60
 const LIVE_MATCH_WINDOW_MS = 4 * 60 * 1000
 
 const TARGET_STATIONS = new Set([WANSTEAD_ID, SNARESBROOK_ID])
+const LEYTONSTONE_ID = "940GZZLULYS"
+const ARRIVAL_STATION_IDS = [WANSTEAD_ID, SNARESBROOK_ID, LEYTONSTONE_ID]
 const CENTRAL_LINE_PAGE = "https://api.tfl.gov.uk/Line/central/Status"
 
 type TflArrival = {
@@ -38,6 +42,15 @@ type TflStatus = {
     statusSeverityDescription: string
     reason?: string
   }[]
+}
+
+class TflRequestError extends Error {
+  status: number
+
+  constructor(status: number) {
+    super(`TfL request failed: ${status}`)
+    this.status = status
+  }
 }
 
 type KnownJourney = {
@@ -130,21 +143,20 @@ const STATIONS: StationNode[] = [
   { id: "940GZZLUWOF", name: "Woodford", x: 154, y: 254 },
   { id: "940GZZLUSWF", name: "South Woodford", x: 264, y: 254 },
   { id: SNARESBROOK_ID, name: "Snaresbrook", x: 374, y: 254 },
-  { id: "940GZZLULYS", name: "Leytonstone", x: 538, y: 166 },
+  { id: LEYTONSTONE_ID, name: "Leytonstone", x: 538, y: 166, labelOffset: -28 },
 ]
 
 const SEGMENTS: TrackSegment[] = [
   { from: "940GZZLUNBP", to: "940GZZLUGTH", durationSec: 120 },
   { from: "940GZZLUGTH", to: "940GZZLURBG", durationSec: 120 },
   { from: "940GZZLURBG", to: WANSTEAD_ID, durationSec: 90 },
-  { from: WANSTEAD_ID, to: "940GZZLULYS", durationSec: 150 },
+  { from: WANSTEAD_ID, to: LEYTONSTONE_ID, durationSec: 150 },
   { from: "940GZZLUBKH", to: "940GZZLUWOF", durationSec: 120 },
   { from: "940GZZLUWOF", to: "940GZZLUSWF", durationSec: 120 },
   { from: "940GZZLUSWF", to: SNARESBROOK_ID, durationSec: 120 },
-  { from: SNARESBROOK_ID, to: "940GZZLULYS", durationSec: 180 },
+  { from: SNARESBROOK_ID, to: LEYTONSTONE_ID, durationSec: 180 },
 ]
 
-const MAP_STATION_IDS = STATIONS.map(station => station.id)
 const stationById = new Map(STATIONS.map(station => [station.id, station]))
 const segmentByTo = new Map(SEGMENTS.map(segment => [segment.to, segment]))
 const segmentByKey = new Map(SEGMENTS.map(segment => [`${segment.from}-${segment.to}`, segment]))
@@ -307,7 +319,7 @@ function advanceTrack(track: TrainTrack, now: number) {
 }
 
 function isAtBlockingStation(marker: TrainMarker) {
-  return marker.progress >= 0.96 || /^At /i.test(marker.currentLocation ?? "")
+  return marker.progress >= 0.96
 }
 
 function placeMarkerOnSegment(segmentKey: string, progress: number, source: Omit<TrainMarker, "x" | "y" | "progress" | "segmentKey">): TrainMarker | null {
@@ -347,6 +359,42 @@ function applyStationBlocking(markers: TrainMarker[]) {
   })
 }
 
+function isVehicleRelevantToBoard(predictions: TflArrival[]) {
+  const hasTargetPrediction = predictions.some(prediction => TARGET_STATIONS.has(prediction.naptanId))
+  const hasJustLeftTarget = predictions.some(prediction =>
+    prediction.naptanId === LEYTONSTONE_ID &&
+    /Wanstead|Snaresbrook/i.test(prediction.currentLocation ?? "")
+  )
+  return hasTargetPrediction || hasJustLeftTarget
+}
+
+function chooseMapPrediction(predictions: TflArrival[], now: number) {
+  const reachable = predictions
+    .filter(prediction => segmentByTo.has(prediction.naptanId))
+    .sort((a, b) => secondsUntil(a.expectedArrival, now) - secondsUntil(b.expectedArrival, now))
+
+  const firstReachable = reachable.find(prediction => {
+    const segment = segmentByTo.get(prediction.naptanId)
+    return segment && secondsUntil(prediction.expectedArrival, now) <= segment.durationSec + 45
+  })
+
+  if (!firstReachable) return null
+
+  const firstSegment = segmentByTo.get(firstReachable.naptanId)
+  const isAtTargetStation = TARGET_STATIONS.has(firstReachable.naptanId) &&
+    (secondsUntil(firstReachable.expectedArrival, now) <= 20 || /^At /i.test(firstReachable.currentLocation ?? ""))
+
+  if (isAtTargetStation && firstSegment) {
+    const nextAfterTarget = reachable.find(prediction => {
+      const segment = segmentByTo.get(prediction.naptanId)
+      return segment?.from === firstReachable.naptanId
+    })
+    if (nextAfterTarget) return nextAfterTarget
+  }
+
+  return firstReachable
+}
+
 function buildTrainMarkers(predictions: TflArrival[], tracks: Map<string, TrainTrack>, now = Date.now()): TrainMarker[] {
   const byVehicle = new Map<string, TflArrival[]>()
 
@@ -359,14 +407,9 @@ function buildTrainMarkers(predictions: TflArrival[], tracks: Map<string, TrainT
 
   const visibleVehicleIds = new Set<string>()
   const markers = [...byVehicle.entries()].flatMap(([vehicleId, group]) => {
-    const sorted = group
-      .filter(prediction => segmentByTo.has(prediction.naptanId))
-      .sort((a, b) => secondsUntil(a.expectedArrival, now) - secondsUntil(b.expectedArrival, now))
+    if (!isVehicleRelevantToBoard(group)) return []
 
-    const next = sorted.find(prediction => {
-      const segment = segmentByTo.get(prediction.naptanId)
-      return segment && secondsUntil(prediction.expectedArrival, now) <= segment.durationSec + 45
-    })
+    const next = chooseMapPrediction(group, now)
 
     if (!next) return []
     const segment = segmentByTo.get(next.naptanId)
@@ -414,7 +457,7 @@ function buildTrainMarkers(predictions: TflArrival[], tracks: Map<string, TrainT
 
 async function getJson<T>(url: string): Promise<T> {
   const response = await fetch(url)
-  if (!response.ok) throw new Error(`TfL request failed: ${response.status}`)
+  if (!response.ok) throw new TflRequestError(response.status)
   return response.json()
 }
 
@@ -424,16 +467,67 @@ function useDepartureData() {
   const [serviceStatus, setServiceStatus] = React.useState<ServiceStatus | null>(null)
   const [lastUpdated, setLastUpdated] = React.useState<Date | null>(null)
   const [error, setError] = React.useState<string | null>(null)
+  const timetablesRef = React.useRef<{
+    wanstead?: TimetableResponse
+    snaresbrook?: TimetableResponse
+  }>({})
+  const statusRef = React.useRef<{
+    status: ServiceStatus | null
+    fetchedAt: number
+  }>({ status: null, fetchedAt: 0 })
+  const inFlightRef = React.useRef(false)
+  const backoffUntilRef = React.useRef(0)
+
+  const getTimetables = React.useCallback(async () => {
+    const cached = timetablesRef.current
+    if (cached.wanstead && cached.snaresbrook) {
+      return [cached.wanstead, cached.snaresbrook] as const
+    }
+
+    const [wansteadTimetable, snaresbrookTimetable] = await Promise.all([
+      cached.wanstead ?? getJson<TimetableResponse>(`https://api.tfl.gov.uk/Line/${LINE_ID}/Timetable/${WANSTEAD_ID}?direction=inbound`),
+      cached.snaresbrook ?? getJson<TimetableResponse>(`https://api.tfl.gov.uk/Line/${LINE_ID}/Timetable/${SNARESBROOK_ID}?direction=inbound`),
+    ])
+
+    timetablesRef.current = {
+      wanstead: wansteadTimetable,
+      snaresbrook: snaresbrookTimetable,
+    }
+
+    return [wansteadTimetable, snaresbrookTimetable] as const
+  }, [])
+
+  const getServiceStatus = React.useCallback(async (now: number) => {
+    if (statusRef.current.status && now - statusRef.current.fetchedAt < STATUS_REFRESH_MS) {
+      return statusRef.current.status
+    }
+
+    const lineStatus = await getJson<TflStatus[]>(CENTRAL_LINE_PAGE)
+    const bestStatus = lineStatus[0]?.lineStatuses?.reduce((mostSevere, current) =>
+      current.statusSeverity < mostSevere.statusSeverity ? current : mostSevere
+    )
+    const nextStatus = bestStatus ? {
+      label: bestStatus.statusSeverityDescription,
+      severity: bestStatus.statusSeverity,
+      reason: bestStatus.reason,
+    } : null
+
+    statusRef.current = { status: nextStatus, fetchedAt: now }
+    return nextStatus
+  }, [])
 
   const fetchData = React.useCallback(async () => {
+    const now = Date.now()
+    if (inFlightRef.current || now < backoffUntilRef.current) return
+    inFlightRef.current = true
+
     try {
-      const [predictionGroups, wansteadTimetable, snaresbrookTimetable, lineStatus] = await Promise.all([
-        Promise.all(MAP_STATION_IDS.map(stationId =>
+      const [[wansteadTimetable, snaresbrookTimetable], predictionGroups, nextServiceStatus] = await Promise.all([
+        getTimetables(),
+        Promise.all(ARRIVAL_STATION_IDS.map(stationId =>
           getJson<TflArrival[]>(`https://api.tfl.gov.uk/Line/${LINE_ID}/Arrivals/${stationId}`)
         )),
-        getJson<TimetableResponse>(`https://api.tfl.gov.uk/Line/${LINE_ID}/Timetable/${WANSTEAD_ID}?direction=inbound`),
-        getJson<TimetableResponse>(`https://api.tfl.gov.uk/Line/${LINE_ID}/Timetable/${SNARESBROOK_ID}?direction=inbound`),
-        getJson<TflStatus[]>(CENTRAL_LINE_PAGE),
+        getServiceStatus(now),
       ])
 
       const allPredictions = predictionGroups.flat().filter(isWestboundCentralTrain)
@@ -459,25 +553,22 @@ function useDepartureData() {
         ...buildScheduledDepartures(SNARESBROOK_ID, snaresbrookTimetable),
       ]
 
-      const bestStatus = lineStatus[0]?.lineStatuses?.reduce((mostSevere, current) =>
-        current.statusSeverity < mostSevere.statusSeverity ? current : mostSevere
-      )
-
       setDepartures(coalesceDepartures(liveDepartures, scheduledDepartures))
       setMapPredictions(allPredictions)
-      setServiceStatus(bestStatus ? {
-        label: bestStatus.statusSeverityDescription,
-        severity: bestStatus.statusSeverity,
-        reason: bestStatus.reason,
-      } : null)
+      setServiceStatus(nextServiceStatus)
       setLastUpdated(new Date())
       setError(null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load TfL data")
-      setDepartures([])
-      setMapPredictions([])
+      if (err instanceof TflRequestError && err.status === 429) {
+        backoffUntilRef.current = Date.now() + RATE_LIMIT_BACKOFF_MS
+        setError("TfL rate limit reached. Keeping the last successful data while polling pauses briefly.")
+      } else {
+        setError(err instanceof Error ? err.message : "Could not load TfL data")
+      }
+    } finally {
+      inFlightRef.current = false
     }
-  }, [])
+  }, [getServiceStatus, getTimetables])
 
   React.useEffect(() => {
     fetchData()
@@ -607,9 +698,9 @@ function MiniMap({ predictions, now }: { predictions: TflArrival[], now: number 
         {STATIONS.map(station => (
           <g key={station.id}>
             <circle cx={station.x} cy={station.y} r="11" fill="white" stroke="#1f2937" strokeWidth="3" />
-            <text x={station.x} y={station.y + (station.labelOffset ?? (station.y > 180 ? 30 : -22))} textAnchor="middle" className="fill-slate-800 text-[12px] font-semibold">
+            <text x={station.x} y={station.y + (station.labelOffset ?? (station.y > 180 ? 30 : -22))} textAnchor="middle" className="fill-slate-800 text-[14px] font-semibold">
               {station.name.split(" ").map((word, index, words) => (
-                <tspan key={word} x={station.x} dy={index === 0 ? 0 : 14}>
+                <tspan key={word} x={station.x} dy={index === 0 ? 0 : 16}>
                   {words.length > 2 && index === 1 ? `${word} ` : word}
                 </tspan>
               ))}
