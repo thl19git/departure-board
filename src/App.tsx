@@ -158,14 +158,45 @@ const SEGMENTS: TrackSegment[] = [
 ]
 
 const stationById = new Map(STATIONS.map(station => [station.id, station]))
-const segmentByTo = new Map(SEGMENTS.map(segment => [segment.to, segment]))
 const segmentByKey = new Map(SEGMENTS.map(segment => [`${segment.from}-${segment.to}`, segment]))
+const WANSTEAD_APPROACH_SEGMENTS = [
+  "940GZZLUNBP-940GZZLUGTH",
+  "940GZZLUGTH-940GZZLURBG",
+  `940GZZLURBG-${WANSTEAD_ID}`,
+]
+const SNARESBROOK_APPROACH_SEGMENTS = [
+  "940GZZLUBKH-940GZZLUWOF",
+  "940GZZLUWOF-940GZZLUSWF",
+  `940GZZLUSWF-${SNARESBROOK_ID}`,
+]
+const LOCATION_SEGMENTS = [
+  { pattern: /between newbury park and gants hill|left newbury park|approaching gants hill/i, segmentKey: "940GZZLUNBP-940GZZLUGTH", progress: 0.55 },
+  { pattern: /at gants hill/i, segmentKey: "940GZZLUNBP-940GZZLUGTH", progress: 1 },
+  { pattern: /between gants hill and redbridge|left gants hill|approaching redbridge/i, segmentKey: "940GZZLUGTH-940GZZLURBG", progress: 0.55 },
+  { pattern: /at redbridge/i, segmentKey: "940GZZLUGTH-940GZZLURBG", progress: 1 },
+  { pattern: /between redbridge and wanstead|left redbridge|approaching wanstead/i, segmentKey: `940GZZLURBG-${WANSTEAD_ID}`, progress: 0.55 },
+  { pattern: /at wanstead/i, segmentKey: `940GZZLURBG-${WANSTEAD_ID}`, progress: 1 },
+  { pattern: /between wanstead and leytonstone|left wanstead|approaching leytonstone/i, segmentKey: `${WANSTEAD_ID}-${LEYTONSTONE_ID}`, progress: 0.55 },
+  { pattern: /between buckhurst hill and woodford|left buckhurst hill|approaching woodford/i, segmentKey: "940GZZLUBKH-940GZZLUWOF", progress: 0.55 },
+  { pattern: /at woodford/i, segmentKey: "940GZZLUBKH-940GZZLUWOF", progress: 1 },
+  { pattern: /between woodford and south woodford|left woodford|approaching south woodford/i, segmentKey: "940GZZLUWOF-940GZZLUSWF", progress: 0.55 },
+  { pattern: /at south woodford/i, segmentKey: "940GZZLUWOF-940GZZLUSWF", progress: 1 },
+  { pattern: /between south woodford and snaresbrook|left south woodford|approaching snaresbrook/i, segmentKey: `940GZZLUSWF-${SNARESBROOK_ID}`, progress: 0.55 },
+  { pattern: /at snaresbrook/i, segmentKey: `940GZZLUSWF-${SNARESBROOK_ID}`, progress: 1 },
+  { pattern: /between snaresbrook and leytonstone|left snaresbrook|approaching leytonstone/i, segmentKey: `${SNARESBROOK_ID}-${LEYTONSTONE_ID}`, progress: 0.55 },
+]
 
 type TrainTrack = {
   segmentKey: string
   progress: number
   speedPerSecond: number
   updatedAt: number
+}
+
+type MapPlacement = {
+  prediction: TflArrival
+  segmentKey: string
+  progress: number
 }
 
 function isWestboundCentralTrain(train: TflArrival) {
@@ -368,31 +399,100 @@ function isVehicleRelevantToBoard(predictions: TflArrival[]) {
   return hasTargetPrediction || hasJustLeftTarget
 }
 
-function chooseMapPrediction(predictions: TflArrival[], now: number) {
-  const reachable = predictions
-    .filter(prediction => segmentByTo.has(prediction.naptanId))
-    .sort((a, b) => secondsUntil(a.expectedArrival, now) - secondsUntil(b.expectedArrival, now))
+function getPathDuration(segmentKeys: string[]) {
+  return segmentKeys.reduce((total, segmentKey) => total + (segmentByKey.get(segmentKey)?.durationSec ?? 0), 0)
+}
 
-  const firstReachable = reachable.find(prediction => {
-    const segment = segmentByTo.get(prediction.naptanId)
-    return segment && secondsUntil(prediction.expectedArrival, now) <= segment.durationSec + 45
-  })
+function placeFromPath(prediction: TflArrival, segmentKeys: string[], now: number): MapPlacement | null {
+  const totalDuration = getPathDuration(segmentKeys)
+  if (totalDuration <= 0) return null
 
-  if (!firstReachable) return null
+  const secondsToTarget = secondsUntil(prediction.expectedArrival, now)
+  const elapsedOnPath = Math.min(totalDuration, Math.max(0, totalDuration - secondsToTarget))
+  let elapsedBeforeSegment = 0
 
-  const firstSegment = segmentByTo.get(firstReachable.naptanId)
-  const isAtTargetStation = TARGET_STATIONS.has(firstReachable.naptanId) &&
-    (secondsUntil(firstReachable.expectedArrival, now) <= 20 || /^At /i.test(firstReachable.currentLocation ?? ""))
-
-  if (isAtTargetStation && firstSegment) {
-    const nextAfterTarget = reachable.find(prediction => {
-      const segment = segmentByTo.get(prediction.naptanId)
-      return segment?.from === firstReachable.naptanId
-    })
-    if (nextAfterTarget) return nextAfterTarget
+  for (const segmentKey of segmentKeys) {
+    const segment = segmentByKey.get(segmentKey)
+    if (!segment) continue
+    const elapsedThroughSegment = elapsedBeforeSegment + segment.durationSec
+    if (elapsedOnPath <= elapsedThroughSegment) {
+      return {
+        prediction,
+        segmentKey,
+        progress: Math.min(1, Math.max(0, (elapsedOnPath - elapsedBeforeSegment) / segment.durationSec)),
+      }
+    }
+    elapsedBeforeSegment = elapsedThroughSegment
   }
 
-  return firstReachable
+  return {
+    prediction,
+    segmentKey: segmentKeys[segmentKeys.length - 1],
+    progress: 1,
+  }
+}
+
+function placeFromCurrentLocation(prediction: TflArrival): MapPlacement | null {
+  const location = prediction.currentLocation ?? ""
+  const match = LOCATION_SEGMENTS.find(candidate => candidate.pattern.test(location))
+  if (!match) return null
+
+  return {
+    prediction,
+    segmentKey: match.segmentKey,
+    progress: match.progress,
+  }
+}
+
+function placeToLeytonstone(prediction: TflArrival, now: number): MapPlacement | null {
+  const currentLocation = prediction.currentLocation ?? ""
+  const fromStationId = /Wanstead/i.test(currentLocation)
+    ? WANSTEAD_ID
+    : /Snaresbrook/i.test(currentLocation)
+      ? SNARESBROOK_ID
+      : null
+  if (!fromStationId) return null
+
+  const segmentKey = `${fromStationId}-${LEYTONSTONE_ID}`
+  const segment = segmentByKey.get(segmentKey)
+  if (!segment) return null
+
+  return {
+    prediction,
+    segmentKey,
+    progress: Math.min(1, Math.max(0, 1 - secondsUntil(prediction.expectedArrival, now) / segment.durationSec)),
+  }
+}
+
+function chooseMapPlacement(predictions: TflArrival[], now: number): MapPlacement | null {
+  const leytonstonePrediction = predictions
+    .filter(prediction => prediction.naptanId === LEYTONSTONE_ID)
+    .sort((a, b) => secondsUntil(a.expectedArrival, now) - secondsUntil(b.expectedArrival, now))
+    .map(prediction => placeToLeytonstone(prediction, now))
+    .find((placement): placement is MapPlacement => placement !== null)
+
+  const targetPredictions = predictions
+    .filter(prediction => TARGET_STATIONS.has(prediction.naptanId))
+    .sort((a, b) => secondsUntil(a.expectedArrival, now) - secondsUntil(b.expectedArrival, now))
+
+  const firstTarget = targetPredictions[0]
+  if (!firstTarget) return leytonstonePrediction ?? null
+
+  const locatedTarget = placeFromCurrentLocation(firstTarget)
+  if (locatedTarget) return locatedTarget
+
+  const firstTargetIsAtPlatform = secondsUntil(firstTarget.expectedArrival, now) <= 20 ||
+    /^At /i.test(firstTarget.currentLocation ?? "")
+  if (firstTargetIsAtPlatform && leytonstonePrediction) return leytonstonePrediction
+
+  if (firstTarget.naptanId === WANSTEAD_ID) {
+    return placeFromPath(firstTarget, WANSTEAD_APPROACH_SEGMENTS, now)
+  }
+  if (firstTarget.naptanId === SNARESBROOK_ID) {
+    return placeFromPath(firstTarget, SNARESBROOK_APPROACH_SEGMENTS, now)
+  }
+
+  return leytonstonePrediction ?? null
 }
 
 function buildTrainMarkers(predictions: TflArrival[], tracks: Map<string, TrainTrack>, now = Date.now()): TrainMarker[] {
@@ -409,21 +509,22 @@ function buildTrainMarkers(predictions: TflArrival[], tracks: Map<string, TrainT
   const markers = [...byVehicle.entries()].flatMap(([vehicleId, group]) => {
     if (!isVehicleRelevantToBoard(group)) return []
 
-    const next = chooseMapPrediction(group, now)
+    const placement = chooseMapPlacement(group, now)
 
-    if (!next) return []
-    const segment = segmentByTo.get(next.naptanId)
-    const to = stationById.get(next.naptanId)
+    if (!placement) return []
+    const next = placement.prediction
+    const segment = segmentByKey.get(placement.segmentKey)
+    const to = segment ? stationById.get(segment.to) : undefined
     if (!segment || !to) return []
 
     const secondsToNext = secondsUntil(next.expectedArrival, now)
-    const segmentKey = `${segment.from}-${segment.to}`
+    const segmentKey = placement.segmentKey
     const track = tracks.get(vehicleId)
-    const observedProgress = Math.min(1, Math.max(0, 1 - secondsToNext / segment.durationSec))
+    const observedProgress = placement.progress
     const previousSegment = track ? segmentByKey.get(track.segmentKey) : undefined
     const isAdjacentHandoff = previousSegment?.to === segment.from
     const currentProgress = track?.segmentKey === segmentKey
-      ? advanceTrack(track, now)
+      ? Math.max(advanceTrack(track, now), observedProgress)
       : isAdjacentHandoff
         ? 0
         : observedProgress
